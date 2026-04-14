@@ -41,11 +41,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+import os
+
 # 初始化大模型客户端
 # client_llm = OpenAI(base_url="https://ark.cn-beijing.volces.com/api/v3", api_key="f67e1b66-b73c-4a5b-8997-e6596e2be7ad")
 client_llm = OpenAI(
     # If the environment variable is not configured, replace the following line with: api_key="sk-xxx"
-    api_key="",
+    api_key=os.getevn("ALIYUN_API_KEY"),
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
@@ -102,6 +104,61 @@ class LlmSegmentResponse(BaseModel):
     news_clip: List[ChapterSummary] = []
 
 
+def arabic_to_zh(num_str: str) -> str:
+    """将阿拉伯数字字符串转换为中文读法"""
+    # 场景 1：如果是以 0 开头的数字（如区号），或者超过 8 位的长数字（如电话），通常逐字直读
+    if num_str.startswith("0") or len(num_str) >= 8:
+        digits_map = "零一二三四五六七八九"
+        return "".join(digits_map[int(c)] for c in num_str)
+
+    # 场景 2：常规数值转换为带量词的读法
+    num = int(num_str)
+    if num == 0:
+        return "零"
+
+    digits = "零一二三四五六七八九"
+    units = ["", "十", "百", "千", "万", "十", "百", "千", "亿"]
+    result = ""
+    s = str(num)
+    n = len(s)
+
+    for i, char in enumerate(s):
+        d = int(char)
+        unit_index = n - 1 - i
+
+        if d != 0:
+            result += digits[d] + units[unit_index]
+        else:
+            # 处理中间的 0 和连续的 0
+            if unit_index % 4 == 0:  # 遇到万、亿位
+                if result.endswith("零"):
+                    result = result[:-1]
+                if not result.endswith(units[unit_index]) and len(result) > 0:
+                    result += units[unit_index]
+            else:
+                if not result.endswith("零"):
+                    result += "零"
+
+    # 收尾清理
+    if result.endswith("零"):
+        result = result[:-1]
+
+    # 习惯修正："一十五" -> "十五"
+    if result.startswith("一十"):
+        result = result[1:]
+
+    # 习惯修正：ASR 通常将 2000 识别为 "两千" 而非 "二千"
+    result = result.replace("二千", "两千").replace("二万", "两万")
+
+    return result
+
+
+def replace_arabic_numbers(text: str) -> str:
+    """使用正则匹配所有的阿拉伯数字，并进行批量中文替换"""
+    pattern = re.compile(r'\d+')
+    return pattern.sub(lambda x: arabic_to_zh(x.group()), text)
+
+
 # --- 核心处理逻辑 ---
 
 def format_timestamp(seconds: float) -> str:
@@ -118,9 +175,6 @@ def format_timestamp_2(seconds: float) -> str:
     s = int(seconds % 60)
     # s = seconds % 60
     return f"{m:02d}:{s:02d}"
-
-
-import re
 
 
 def time_to_seconds(t) -> float:
@@ -151,15 +205,9 @@ def time_to_seconds(t) -> float:
 
 
 def process_funasr_output(raw_res) -> List[dict]:
-    """
-    将 FunASR 的输出转换为句子级分段格式（移除了大模型调用逻辑）
-    """
-    data = {}
-    # --- 1. 数据提取 ---
-    # --- 核心修复：自动解包逻辑 ---
+    # --- 1. 数据提取与解包 (保持不变) ---
     if isinstance(raw_res, tuple):
         raw_res = raw_res[0]
-
     if isinstance(raw_res, list) and len(raw_res) > 0:
         data = raw_res[0][0] if isinstance(raw_res[0], list) else raw_res[0]
     else:
@@ -168,18 +216,10 @@ def process_funasr_output(raw_res) -> List[dict]:
     full_text = data.get('text', '')
     ctc_timestamps = data.get('ctc_timestamps', [])
 
-    if not isinstance(data, dict):
-        print(f"ERROR: 无法解析数据结构: {raw_res}")
+    if not full_text or not ctc_timestamps:
         return []
 
-    full_text = data.get('text', '')
-    ctc_timestamps = data.get('ctc_timestamps', [])
-
-    if not full_text:
-        return []
-
-    # --- 2. 预处理：建立 Token 索引映射 ---
-    # 我们把所有原始 Token 拼成一串纯文本，并记录每个字符对应的 Token 索引
+    # --- 2. 建立 Token 索引映射 (保持不变) ---
     token_str = ""
     char_to_token_idx = []
 
@@ -189,49 +229,108 @@ def process_funasr_output(raw_res) -> List[dict]:
             token_str += _
             char_to_token_idx.append(i)
 
-    # --- 3. 句子切分 ---
-    # 仅按 。？！ 切分，保留标点
-    raw_parts = re.split(r'([。？！])', full_text)
-    sentences = []
-
+    # --- 3. 智能句子切分 (解决切分粒度过大问题) ---
+    # 第一层切分：用句号、问号、叹号、换行符切分
+    raw_parts = re.split(r'([。？！\n])', full_text)
+    temp_sentences = []
     temp_s = ""
     for p in raw_parts:
         temp_s += p
-        if p in ['。', '？', '！']:
-            if temp_s.strip(): sentences.append(temp_s.strip())
+        if p in ['。', '？', '！', '\n']:
+            if temp_s.strip(): temp_sentences.append(temp_s.strip())
             temp_s = ""
-    if temp_s.strip(): sentences.append(temp_s.strip())
+    if temp_s.strip(): temp_sentences.append(temp_s.strip())
 
-    # --- 4. 模糊对齐寻找时间轴 ---
-    asr_sentences = []
-    search_start_pos = 0
-
-    for sen in sentences:
-        # 清洗句子：去掉空格、标点，转小写，用于匹配
-        sen_clean = re.sub(r'[^\w]', '', sen).lower()
-        if not sen_clean: continue
-
-        # 在 token_str 中寻找与当前句子最相似的片段
-        # 我们只在当前游标之后的片段里找，提高速度和准确度
-        sub_token_str = token_str[search_start_pos:]
-        matcher = SequenceMatcher(None, sen_clean, sub_token_str)
-        match = matcher.find_longest_match(0, len(sen_clean), 0, len(sub_token_str))
-
-        if match.size > 0:
-            # 找到匹配片段在全局 token_str 中的起止位置
-            matched_start_in_global = search_start_pos + match.b
-            matched_end_in_global = matched_start_in_global + match.size - 1
-
-            # 映射回 ctc_timestamps 的索引
-            start_token_idx = char_to_token_idx[matched_start_in_global]
-            end_token_idx = char_to_token_idx[matched_end_in_global]
-
-            # 更新下一次搜索的起始位置
-            search_start_pos = matched_end_in_global + 1
+    # 第二层切分：遇到极长的句子（>80字），在逗号处强行切断，防止时间跨度过大
+    sentences = []
+    for sen in temp_sentences:
+        if len(sen) > 80 and '，' in sen:
+            sub_parts = re.split(r'([，；])', sen)
+            sub_s = ""
+            for sp in sub_parts:
+                sub_s += sp
+                if sp in ['，', '；']:
+                    if sub_s.strip(): sentences.append(sub_s.strip())
+                    sub_s = ""
+            if sub_s.strip(): sentences.append(sub_s.strip())
         else:
-            # 如果完全没匹配到（极端情况），使用比例兜底
-            start_token_idx = char_to_token_idx[min(search_start_pos, len(char_to_token_idx) - 1)]
-            end_token_idx = start_token_idx
+            sentences.append(sen)
+
+    # --- 4. 比例锚点 + 动态窗口对齐 (解决长视频累积漂移) ---
+    asr_sentences = []
+
+    # 预计算所有干净句子的总长度，用于计算全局比例
+    clean_sentences = []
+    for sen in sentences:
+        clean_sen = re.sub(r'[^\w]', '', sen).lower()
+        clean_sen = replace_arabic_numbers(clean_sen)
+        clean_sentences.append(clean_sen)
+
+    total_clean_chars = sum(len(s) for s in clean_sentences)
+    total_token_chars = len(token_str)
+    current_clean_char_idx = 0
+
+    for i, sen in enumerate(sentences):
+        sen_clean = clean_sentences[i]
+        expected_len = len(sen_clean)
+
+        if expected_len == 0:
+            continue
+
+        # 【核心优化 1：计算全局比例锚点】
+        # 判断这句话在全文的进度，直接推算出它在 token_str 中的绝对位置
+        ratio = current_clean_char_idx / total_clean_chars if total_clean_chars > 0 else 0
+        anchor_pos = int(ratio * total_token_chars)
+
+        # 【核心优化 2：以锚点为中心展开窗口】
+        # 窗口大小：句子长度 + 前后各 80 个字符的容错空间，再乱也能框住
+        margin = max(80, int(expected_len * 1.5))
+        window_start = max(0, anchor_pos - margin)
+        window_end = min(total_token_chars, anchor_pos + expected_len + margin)
+
+        sub_token_str = token_str[window_start:window_end]
+
+        matcher = SequenceMatcher(None, sen_clean, sub_token_str)
+
+        # --- 终极优化：碎片缝合算法 ---
+        # 获取所有的匹配碎片块 (Match对象列表)
+        blocks = matcher.get_matching_blocks()
+
+        # 过滤掉太小的碎片（如偶然匹配上的单个字），防止拉扯边界
+        min_blk_size = 2 if expected_len >= 4 else 1
+        valid_blocks = [blk for blk in blocks if blk.size >= min_blk_size]
+
+        total_matched = sum(blk.size for blk in valid_blocks)
+        min_match_thresh = max(2, int(expected_len * 0.15))
+
+        if total_matched >= min_match_thresh and valid_blocks:
+            first_block = valid_blocks[0]
+            last_block = valid_blocks[-1]
+
+            # 计算这些碎片在 sub_token_str 中的跨度
+            span_in_sub = (last_block.b + last_block.size) - first_block.b
+
+            # 防御机制：如果跨度大得离谱（比如跨越了预期长度的 2.5 倍），说明首尾抓到了错误的噪声字符
+            if span_in_sub > expected_len * 2.5:
+                # 跨度过大，退化回使用最大的一块连续碎片
+                largest_block = max(valid_blocks, key=lambda x: x.size)
+                matched_start_in_global = window_start + largest_block.b
+                matched_end_in_global = window_start + largest_block.b + largest_block.size - 1
+            else:
+                # 正常缝合：起始位置取第一个碎片的开头，结束位置取最后一个碎片的结尾
+                matched_start_in_global = window_start + first_block.b
+                matched_end_in_global = window_start + last_block.b + last_block.size - 1
+
+            start_token_idx = char_to_token_idx[min(matched_start_in_global, len(char_to_token_idx) - 1)]
+            end_token_idx = char_to_token_idx[min(matched_end_in_global, len(char_to_token_idx) - 1)]
+        else:
+            # 【核心优化 3：全局比例强制兜底】
+            # 如果彻底乱码匹配不上，不依赖游标，直接用这句话的真实进度比例换算时间轴！
+            start_ratio = current_clean_char_idx / total_clean_chars
+            end_ratio = min(1.0, (current_clean_char_idx + expected_len) / total_clean_chars)
+
+            start_token_idx = char_to_token_idx[min(int(start_ratio * total_token_chars), len(char_to_token_idx) - 1)]
+            end_token_idx = char_to_token_idx[min(int(end_ratio * total_token_chars), len(char_to_token_idx) - 1)]
 
         asr_sentences.append({
             "start": format_timestamp_2(ctc_timestamps[start_token_idx]['start_time']),
@@ -239,54 +338,10 @@ def process_funasr_output(raw_res) -> List[dict]:
             "asr_sentence": sen
         })
 
-    return asr_sentences
+        # 推进全局进度
+        current_clean_char_idx += expected_len
 
-    # punctuations = set(['。', '？', '！', '，', '、'])
-    #
-    # asr_sentences = []
-    # current_seg_start = None
-    # current_seg_end = 0.0
-    # ts_index = 0
-    # segment_text_accumulator = ""
-    #
-    # for char in full_text:
-    #     segment_text_accumulator += char
-    #     is_punct = char in punctuations
-    #
-    #     if not is_punct:
-    #         if ts_index < len(ctc_timestamps):
-    #             ts_item = ctc_timestamps[ts_index]
-    #             if current_seg_start is None:
-    #                 current_seg_start = ts_item['start_time']
-    #             current_seg_end = ts_item['end_time']
-    #             ts_index += 1
-    #
-    #     if is_punct:
-    #         if current_seg_start is not None:
-    #             start_str = format_timestamp(current_seg_start)
-    #             end_str = format_timestamp(current_seg_end)
-    #
-    #             asr_sentences.append({
-    #                 "start": start_str,
-    #                 "end": end_str,
-    #                 "asr_sentence": segment_text_accumulator
-    #             })
-    #
-    #         current_seg_start = None
-    #         current_seg_end = 0.0
-    #         segment_text_accumulator = ""
-    #
-    # # 处理最后一句
-    # if segment_text_accumulator and current_seg_start is not None:
-    #     start_str = format_timestamp(current_seg_start)
-    #     end_str = format_timestamp(current_seg_end)
-    #     asr_sentences.append({
-    #         "start": start_str,
-    #         "end": end_str,
-    #         "asr_sentence": segment_text_accumulator
-    #     })
-    #
-    # return asr_sentences
+    return asr_sentences
 
 
 # --- 接口 1：ASR 提取接口 ---
@@ -430,6 +485,6 @@ if __name__ == "__main__":
     import asyncio
     import uvicorn
 
-    config = uvicorn.Config(app, host="0.0.0.0", port=8800)
+    config = uvicorn.Config(app, host="0.0.0.0", port=8802)
     server = uvicorn.Server(config)
     asyncio.run(server.serve())
