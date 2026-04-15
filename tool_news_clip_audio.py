@@ -418,7 +418,7 @@ def segment_news(request: LlmSegmentRequest):
                 {"role": "user", "content": str(asr_sentences)}
             ],
             stream=False,
-            max_tokens=16384,
+            max_tokens=512,
             temperature=0.1,
             top_p=0.9,
             extra_body={"enable_thinking": False}
